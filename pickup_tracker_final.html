@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>接送導航</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang HK","Microsoft JhengHei",sans-serif;color:#202124}
+#map{height:55vh;min-height:360px}
+.screen{position:fixed;inset:0;background:#fff;z-index:20;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{width:min(360px,100%);text-align:center}
+.card h1{font-size:22px}
+.input{width:100%;padding:13px;border:1px solid #bbb;border-radius:8px;font-size:18px;text-align:center;margin:8px 0 12px}
+button{border:0;border-radius:8px;padding:13px 15px;font-size:16px;background:#1967d2;color:#fff;cursor:pointer}
+.wide{width:100%;margin-top:8px}
+.green{background:#188038}
+.orange{background:#f9ab00;color:#202124}
+.gray{background:#eee;color:#202124}
+.role{display:block;width:100%;margin:12px 0;padding:18px;font-size:18px}
+.toolbar{position:absolute;top:10px;right:10px;z-index:5;display:flex;gap:6px}
+.room{background:#fff;color:#202124;border:1px solid #ccc;padding:9px 12px;box-shadow:0 1px 4px #0003}
+.panel{padding:10px 14px}
+.status{font-size:14px;min-height:22px;color:#555;white-space:pre-wrap}
+.nav{display:flex;gap:8px}
+.nav button{flex:1}
+.error{color:#c5221f;min-height:20px;font-size:14px}
+.modal{position:fixed;inset:0;background:#0006;z-index:30;display:none;align-items:center;justify-content:center}
+.modalbox{background:#fff;border-radius:12px;padding:18px;width:min(330px,calc(100% - 40px))}
+.steps{max-height:180px;overflow:auto;margin-top:8px;font-size:14px}
+.step{padding:7px 0;border-bottom:1px solid #eee}
+</style>
+</head>
+<body>
+
+<div id="passwordScreen" class="screen">
+  <div class="card">
+    <h1>接送導航</h1>
+    <p>請輸入密碼</p>
+    <input id="passwordInput" class="input" type="password" inputmode="numeric" maxlength="4" autocomplete="off">
+    <div id="passwordError" class="error"></div>
+    <button type="button" id="passwordBtn" class="wide">進入</button>
+  </div>
+</div>
+
+<div id="roleScreen" class="screen" style="display:none">
+  <div class="card">
+    <h1>選擇身份</h1>
+    <button type="button" id="driverBtn" class="role">🚗 我係司機</button>
+    <button type="button" id="passengerBtn" class="role green">🧍 我係乘客</button>
+    <p>預設房號：0001</p>
+  </div>
+</div>
+
+<div class="toolbar">
+  <button type="button" id="roomBtn" class="room" style="display:none">房號 <span id="roomText">0001</span> ▾</button>
+</div>
+
+<div id="map"></div>
+
+<div class="panel">
+  <div id="status" class="status">請先輸入密碼</div>
+  <div class="nav">
+    <button type="button" id="navigateBtn" style="display:none">🧭 開 Google Maps 導航</button>
+    <button type="button" id="arrivalBtn" class="green" style="display:none">📍 到達等候點</button>
+  </div>
+  <div id="steps" class="steps"></div>
+</div>
+
+<div id="roomModal" class="modal">
+  <div class="modalbox">
+    <h3>轉房／開新房</h3>
+    <input id="roomInput" class="input" placeholder="例如 0002" maxlength="20">
+    <button type="button" id="joinBtn" class="wide">確認轉房</button>
+    <button type="button" id="newBtn" class="wide orange">開新房</button>
+    <button type="button" id="closeBtn" class="wide gray">取消</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var APP_PASSWORD = '0813';
+  var GOOGLE_MAPS_API_KEY = 'AIzaSyAyMo3Bbf0Rg5EYkTUQ539V_cbNUO_FFcg';
+  var FIREBASE_CONFIG = {
+    apiKey: 'AIzaSyAeeZza00rqU7rMhCS2rDxgDDDKbRdR144',
+    authDomain: 'pickup-tracker-5032f.firebaseapp.com',
+    databaseURL: 'https://pickup-tracker-5032f-default-rtdb.asia-southeast1.firebasedatabase.app',
+    projectId: 'pickup-tracker-5032f',
+    storageBucket: 'pickup-tracker-5032f.firebasestorage.app',
+    messagingSenderId: '116867625005',
+    appId: '1:116867625005:web:471c15c1913d1dce8688a4'
+  };
+  var DEFAULT_ROOM = '0001';
+  var MOVE_METERS = 10;
+
+  var role = null;
+  var room = localStorage.getItem('pickupRoom') || DEFAULT_ROOM;
+  var map = null;
+  var db = null;
+  var watchId = null;
+  var driverPos = null;
+  var lastSent = null;
+  var arrived = false;
+  var passengerMarker = null;
+  var driverMarker = null;
+  var directionsService = null;
+  var directionsRenderer = null;
+  var lastPassenger = null;
+  var roomRef = null;
+  var routeRequestId = 0;
+
+  function $(id) { return document.getElementById(id); }
+  var statusEl = $('status');
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function loadScript(src, label) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = function () { resolve(); };
+      s.onerror = function () { reject(new Error(label + ' 載入失敗')); };
+      document.head.appendChild(s);
+    });
+  }
+
+  function distanceMeters(a, b) {
+    var R = 6371000;
+    function toRad(x) { return x * Math.PI / 180; }
+    var dLat = toRad(b.lat - a.lat);
+    var dLng = toRad(b.lng - a.lng);
+    var q = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) *
+      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return 2 * R * Math.atan2(Math.sqrt(q), Math.sqrt(1 - q));
+  }
+
+  function updateRoomLabel() {
+    localStorage.setItem('pickupRoom', room);
+    $('roomText').textContent = room;
+  }
+
+  function getCurrentLocation() {
+    return new Promise(function (resolve, reject) {
+      navigator.geolocation.getCurrentPosition(
+        function (pos) {
+          resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        },
+        reject,
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000 }
+      );
+    });
+  }
+
+  function unlock() {
+    sessionStorage.setItem('pickupUnlocked', '1');
+    $('passwordScreen').style.display = 'none';
+    $('roleScreen').style.display = 'flex';
+    $('passwordInput').value = '';
+  }
+
+  function checkPassword() {
+    var value = $('passwordInput').value;
+    if (value === APP_PASSWORD) {
+      unlock();
+    } else {
+      $('passwordError').textContent = '密碼不正確，請再試一次';
+      $('passwordInput').select();
+    }
+  }
+
+  function stopWatch() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+  }
+
+  function bindRoom() {
+    if (roomRef) { roomRef.off(); }
+    roomRef = db.ref('rides/' + room + '/passengerLocation');
+    updateRoomLabel();
+    if (role === 'driver') {
+      roomRef.on('value', onPassengerData);
+    }
+  }
+
+  function startApp(selectedRole) {
+    role = selectedRole;
+    $('roleScreen').style.display = 'none';
+    $('roomBtn').style.display = 'block';
+    setStatus('正在載入，請稍候…');
+
+    var setupPromise;
+    if (!db) {
+      setupPromise = loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js', 'Firebase App SDK')
+        .then(function () {
+          return loadScript('https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js', 'Firebase Database SDK');
+        })
+        .then(function () {
+          firebase.initializeApp(FIREBASE_CONFIG);
+          db = firebase.database();
+        });
+    } else {
+      setupPromise = Promise.resolve();
+    }
+
+    setupPromise
+      .then(function () {
+        if (!map) {
+          return loadScript('https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(GOOGLE_MAPS_API_KEY), 'Google Maps JavaScript API')
+            .then(function () {
+              if (!window.google || !window.google.maps) {
+                throw new Error('Google Maps 未能成功載入，請檢查 API key 或 Billing 設定');
+              }
+              map = new google.maps.Map($('map'), {
+                center: { lat: 22.3193, lng: 114.1694 },
+                zoom: 14,
+                mapTypeControl: false,
+                streetViewControl: false
+              });
+              directionsService = new google.maps.DirectionsService();
+              directionsRenderer = new google.maps.DirectionsRenderer({
+                map: map,
+                suppressMarkers: false
+              });
+            });
+        }
+      })
+      .then(function () {
+        bindRoom();
+        if (role === 'passenger') {
+          startPassenger();
+        } else {
+          startDriver();
+        }
+      })
+      .catch(function (error) {
+        setStatus('啟動失敗：' + error.message);
+      });
+  }
+
+  function startPassenger() {
+    stopWatch();
+    $('arrivalBtn').style.display = 'block';
+    setStatus('乘客模式：請允許定位');
+    passengerMarker = new google.maps.Marker({ map: map, label: '你' });
+
+    watchId = navigator.geolocation.watchPosition(
+      function (pos) {
+        var point = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        map.setCenter(point);
+        passengerMarker.setPosition(point);
+        sendIfNeeded(point, false);
+      },
+      function (error) {
+        setStatus('乘客定位失敗：' + error.message);
+      },
+      { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 }
+    );
+  }
+
+  function sendIfNeeded(point, force) {
+    var moved = lastSent ? distanceMeters(lastSent, point) : Infinity;
+    if (force || moved >= MOVE_METERS) {
+      lastSent = point;
+      roomRef.set({
+        lat: point.lat,
+        lng: point.lng,
+        arrived: force || arrived,
+        updatedAt: Date.now()
+      });
+      setStatus(force ? '✅ 已通知司機你到達等候點' : '位置已更新');
+    }
+  }
+
+  function startDriver() {
+    stopWatch();
+    $('navigateBtn').style.display = 'block';
+    setStatus('司機模式：請允許定位，等待乘客位置');
+    driverMarker = new google.maps.Marker({ map: map, label: '車' });
+
+    watchId = navigator.geolocation.watchPosition(
+      function (pos) {
+        driverPos = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        driverMarker.setPosition(driverPos);
+        if (lastPassenger) {
+          drawRoute(driverPos, lastPassenger, { arrived: arrived });
+        }
+      },
+      function (error) {
+        setStatus('司機定位失敗：' + error.message);
+      },
+      { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 }
+    );
+  }
+
+  function onPassengerData(snapshot) {
+    var data = snapshot.val();
+    if (!data) { return; }
+    lastPassenger = { lat: Number(data.lat), lng: Number(data.lng) };
+    arrived = !!data.arrived;
+    setStatus((data.arrived ? '🔴 乘客已到達等候點' : '🟡 乘客位置已更新') + ' · 房號 ' + room);
+    $('navigateBtn').style.display = 'block';
+    if (driverPos) {
+      drawRoute(driverPos, lastPassenger, data);
+    }
+  }
+
+  function drawRoute(origin, destination, data) {
+    var requestId = ++routeRequestId;
+    directionsService.route(
+      {
+        origin: origin,
+        destination: destination,
+        travelMode: google.maps.TravelMode.DRIVING
+      },
+      function (result, routeStatus) {
+        if (requestId !== routeRequestId) { return; }
+        if (routeStatus === 'OK' && result) {
+          directionsRenderer.setDirections(result);
+          var leg = result.routes[0] && result.routes[0].legs[0];
+          if (leg) {
+            var html = '';
+            for (var i = 0; i < leg.steps.length; i++) {
+              var step = leg.steps[i];
+              html += '<div class="step">' + (i + 1) + '. ' + step.instructions + '（' + step.distance.text + '）</div>';
+            }
+            $('steps').innerHTML = html;
+            setStatus((data.arrived ? '🔴 乘客已到達等候點' : '🟡 路線已更新') + ' · ' + leg.duration.text);
+          } else {
+            $('steps').innerHTML = '';
+          }
+        } else {
+          setStatus('暫時無法計算路線：' + routeStatus + '；可撳「開 Google Maps 導航」');
+        }
+      }
+    );
+  }
+
+  function openGoogleNavigation() {
+    if (!lastPassenger) {
+      setStatus('尚未收到乘客位置');
+      return;
+    }
+    var url = 'https://www.google.com/maps/dir/?api=1&destination=' +
+      encodeURIComponent(lastPassenger.lat + ',' + lastPassenger.lng) +
+      '&travelmode=driving&dir_action=navigate';
+    window.location.href = url;
+  }
+
+  function init() {
+    updateRoomLabel();
+
+    $('passwordBtn').addEventListener('click', checkPassword);
+    $('passwordInput').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); checkPassword(); }
+    });
+
+    $('driverBtn').addEventListener('click', function () { startApp('driver'); });
+    $('passengerBtn').addEventListener('click', function () { startApp('passenger'); });
+
+    $('navigateBtn').addEventListener('click', openGoogleNavigation);
+    $('arrivalBtn').addEventListener('click', function () {
+      arrived = true;
+      getCurrentLocation()
+        .then(function (point) { sendIfNeeded(point, true); })
+        .catch(function (e) { setStatus('無法取得位置：' + e.message); });
+    });
+
+    $('roomBtn').addEventListener('click', function () {
+      $('roomInput').value = room;
+      $('roomModal').style.display = 'flex';
+    });
+    $('closeBtn').addEventListener('click', function () {
+      $('roomModal').style.display = 'none';
+    });
+    $('joinBtn').addEventListener('click', function () {
+      room = $('roomInput').value.trim() || DEFAULT_ROOM;
+      bindRoom();
+      $('roomModal').style.display = 'none';
+      setStatus('已轉到房號 ' + room);
+    });
+    $('newBtn').addEventListener('click', function () {
+      room = String(Math.floor(1000 + Math.random() * 9000));
+      bindRoom();
+      $('roomModal').style.display = 'none';
+      setStatus('已開新房 ' + room);
+    });
+
+    if (sessionStorage.getItem('pickupUnlocked') === '1') {
+      unlock();
+    }
+  }
+
+  window.addEventListener('error', function (event) {
+    var el = $('passwordError');
+    if (el) { el.textContent = 'JavaScript 錯誤：' + event.message; }
+    setStatus('JavaScript 錯誤：' + event.message);
+  });
+
+  init();
+})();
+</script>
+</body>
+</html>
